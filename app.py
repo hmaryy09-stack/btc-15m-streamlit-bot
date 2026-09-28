@@ -28,9 +28,10 @@ KALSHI_HOSTS = [
 SERIES = "KXBTC15M"
 
 REFRESH_SECONDS = 10
+PREVIEW_SECONDS = 180
+
 SUGGESTED_SIZE = 25
 MIN_EXPECTED_RETURN = 0.10
-PREVIEW_SECONDS = 180
 
 
 # ============================================================
@@ -75,10 +76,6 @@ st.markdown(
         padding: 10px;
         margin: 8px 0;
     }
-
-    .small {
-        font-size: 0.85rem;
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -91,13 +88,6 @@ st.markdown(
 
 def now_utc():
     return datetime.now(timezone.utc)
-
-
-def money(value):
-    if value is None:
-        return "—"
-
-    return f"${value:,.2f}"
 
 
 def parse_dt(value):
@@ -118,6 +108,13 @@ def parse_dt(value):
         return None
 
 
+def money(value):
+    if value is None:
+        return "—"
+
+    return f"${value:,.2f}"
+
+
 def countdown(seconds):
     seconds = max(0, int(seconds))
 
@@ -128,11 +125,11 @@ def countdown(seconds):
 
 
 # ============================================================
-# BTC — KRAKEN
+# KRAKEN — HISTORIAL BTC
 # ============================================================
 
 @st.cache_data(ttl=5, show_spinner=False)
-def get_btc_data():
+def get_btc_history():
 
     response = requests.get(
         KRAKEN_URL,
@@ -151,13 +148,18 @@ def get_btc_data():
         errors = payload["error"]
 
         if isinstance(errors, list):
-            errors = ", ".join(str(x) for x in errors)
+            errors = ", ".join(
+                str(x) for x in errors
+            )
 
         raise RuntimeError(
             f"Kraken: {errors}"
         )
 
-    result = payload.get("result", {})
+    result = payload.get(
+        "result",
+        {},
+    )
 
     pair_key = next(
         (
@@ -170,35 +172,112 @@ def get_btc_data():
 
     if not pair_key:
         raise RuntimeError(
-            "Kraken no devolvió datos de BTC."
+            "Kraken no devolvió BTC."
         )
 
     candles = result[pair_key]
 
-    closes = []
+    data = []
 
     for candle in candles:
 
-        if len(candle) >= 5:
+        if len(candle) < 5:
+            continue
 
-            try:
-                closes.append(
-                    float(candle[4])
-                )
+        try:
 
-            except (TypeError, ValueError):
-                pass
+            timestamp = float(
+                candle[0]
+            )
 
-    if len(closes) < 16:
+            close = float(
+                candle[4]
+            )
+
+            data.append(
+                {
+                    "timestamp": timestamp,
+                    "close": close,
+                }
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+    if len(data) < 20:
+
         raise RuntimeError(
             "No hay suficientes datos de BTC."
         )
 
+    data.sort(
+        key=lambda x: x["timestamp"]
+    )
+
+    return data
+
+
+# ============================================================
+# BTC ACTUAL
+# ============================================================
+
+def get_current_btc(history):
+
+    if not history:
+        return None
+
+    return float(
+        history[-1]["close"]
+    )
+
+
+# ============================================================
+# BTC EN UN MOMENTO ESPECÍFICO
+# ============================================================
+
+def btc_snapshot_at(
+    history,
+    target_datetime,
+):
+
+    target_timestamp = (
+        target_datetime.timestamp()
+    )
+
+    candles = [
+        item
+        for item in history
+        if item["timestamp"]
+        < target_timestamp
+    ]
+
+    if len(candles) < 16:
+
+        return None
+
+    candles = candles[-16:]
+
+    closes = [
+        float(item["close"])
+        for item in candles
+    ]
+
     price = closes[-1]
 
-    def percentage_change(minutes):
+    def change(minutes):
 
-        previous = closes[-1 - minutes]
+        if len(closes) <= minutes:
+            return 0.0
+
+        previous = closes[
+            -1 - minutes
+        ]
+
+        if previous == 0:
+            return 0.0
 
         return (
             (price - previous)
@@ -207,11 +286,11 @@ def get_btc_data():
 
     return {
         "price": price,
-        "c1": percentage_change(1),
-        "c3": percentage_change(3),
-        "c5": percentage_change(5),
-        "c10": percentage_change(10),
-        "c15": percentage_change(15),
+        "c1": change(1),
+        "c3": change(3),
+        "c5": change(5),
+        "c10": change(10),
+        "c15": change(15),
     }
 
 
@@ -236,23 +315,38 @@ def model_signal(btc):
     )
 
     if raw_score > 0:
-        raw_score -= volatility * 0.05
+
+        raw_score -= (
+            volatility * 0.05
+        )
+
     else:
-        raw_score += volatility * 0.05
 
-    yes_probability = (
-        0.50 + raw_score * 18.0
+        raw_score += (
+            volatility * 0.05
+        )
+
+    probability = (
+        0.50
+        + raw_score * 18.0
     )
 
-    yes_probability = max(
+    probability = max(
         0.16,
-        min(0.84, yes_probability),
+        min(0.84, probability),
     )
 
-    if yes_probability >= 0.50:
-        return "SUBE", yes_probability
+    if probability >= 0.50:
 
-    return "BAJA", 1.0 - yes_probability
+        return (
+            "SUBE",
+            probability,
+        )
+
+    return (
+        "BAJA",
+        1.0 - probability,
+    )
 
 
 def strength(probability):
@@ -270,10 +364,62 @@ def strength(probability):
 
 
 # ============================================================
+# SEÑAL FIJA DE LA VELA
+# ============================================================
+
+@st.cache_data(
+    show_spinner=False
+)
+def locked_signal(
+    ticker,
+    open_time_iso,
+):
+
+    open_time = parse_dt(
+        open_time_iso
+    )
+
+    if open_time is None:
+
+        raise RuntimeError(
+            "No se pudo determinar "
+            "la apertura del mercado."
+        )
+
+    history = get_btc_history()
+
+    btc_at_open = btc_snapshot_at(
+        history,
+        open_time,
+    )
+
+    if btc_at_open is None:
+
+        raise RuntimeError(
+            "No hay suficiente historial "
+            "de BTC para calcular la señal "
+            "al inicio de esta vela."
+        )
+
+    direction, probability = (
+        model_signal(btc_at_open)
+    )
+
+    return {
+        "direction": direction,
+        "probability": probability,
+        "btc_at_open": btc_at_open,
+    }
+
+
+# ============================================================
 # KALSHI — MERCADOS
 # ============================================================
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(
+    ttl=5,
+    show_spinner=False,
+)
 def get_kalshi_markets():
 
     errors = []
@@ -301,7 +447,11 @@ def get_kalshi_markets():
                 [],
             )
 
-            if isinstance(markets, list):
+            if isinstance(
+                markets,
+                list,
+            ):
+
                 return markets
 
         except Exception as exc:
@@ -319,7 +469,9 @@ def get_kalshi_markets():
 def market_open(market):
 
     return parse_dt(
-        market.get("open_time")
+        market.get(
+            "open_time"
+        )
     )
 
 
@@ -327,11 +479,15 @@ def market_close(market):
 
     return parse_dt(
         market.get("close_time")
-        or market.get("expiration_time")
+        or market.get(
+            "expiration_time"
+        )
     )
 
 
-def find_current_market(markets):
+def find_current_market(
+    markets,
+):
 
     now = now_utc()
 
@@ -339,8 +495,13 @@ def find_current_market(markets):
 
     for market in markets:
 
-        open_time = market_open(market)
-        close_time = market_close(market)
+        open_time = market_open(
+            market
+        )
+
+        close_time = market_close(
+            market
+        )
 
         if close_time is None:
             continue
@@ -348,18 +509,25 @@ def find_current_market(markets):
         if close_time <= now:
             continue
 
-        if open_time is not None and open_time > now:
+        if (
+            open_time is not None
+            and open_time > now
+        ):
             continue
 
         status = str(
-            market.get("status", "")
+            market.get(
+                "status",
+                "",
+            )
         ).lower()
 
         if status not in {
-            "active",
-            "open",
             "",
+            "open",
+            "active",
         }:
+
             continue
 
         candidates.append(
@@ -370,7 +538,7 @@ def find_current_market(markets):
         )
 
     candidates.sort(
-        key=lambda item: item[0]
+        key=lambda x: x[0]
     )
 
     if not candidates:
@@ -403,6 +571,7 @@ def find_next_market(
             close_time is not None
             and close_time > current_close
         ):
+
             candidates.append(
                 (
                     close_time,
@@ -411,7 +580,7 @@ def find_next_market(
             )
 
     candidates.sort(
-        key=lambda item: item[0]
+        key=lambda x: x[0]
     )
 
     if not candidates:
@@ -421,36 +590,45 @@ def find_next_market(
 
 
 # ============================================================
-# KALSHI — PRECIO EN VIVO
+# KALSHI — PROBABILIDAD EN VIVO
 # ============================================================
 
-def read_dollar_price(value):
+def dollar_probability(value):
 
     if value is None:
         return None
 
     try:
 
-        price = float(value)
+        value = float(value)
 
         return max(
             0.0,
-            min(1.0, price),
+            min(1.0, value),
         )
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
 
         return None
 
 
-def kalshi_yes_probability(market):
+def kalshi_yes_probability(
+    market,
+):
 
-    yes_bid = read_dollar_price(
-        market.get("yes_bid_dollars")
+    yes_bid = dollar_probability(
+        market.get(
+            "yes_bid_dollars"
+        )
     )
 
-    yes_ask = read_dollar_price(
-        market.get("yes_ask_dollars")
+    yes_ask = dollar_probability(
+        market.get(
+            "yes_ask_dollars"
+        )
     )
 
     if (
@@ -459,25 +637,35 @@ def kalshi_yes_probability(market):
     ):
 
         return (
-            yes_bid + yes_ask
+            yes_bid
+            + yes_ask
         ) / 2.0
 
-    last_price = read_dollar_price(
-        market.get("last_price_dollars")
+    last_price = dollar_probability(
+        market.get(
+            "last_price_dollars"
+        )
     )
 
     if last_price is not None:
+
         return last_price
 
-    # Compatibilidad con respuestas antiguas
-    yes_bid_old = market.get("yes_bid")
-    yes_ask_old = market.get("yes_ask")
+    # Compatibilidad con campos antiguos
+
+    old_bid = market.get(
+        "yes_bid"
+    )
+
+    old_ask = market.get(
+        "yes_ask"
+    )
 
     try:
 
         if (
-            yes_bid_old is not None
-            and yes_ask_old is not None
+            old_bid is not None
+            and old_ask is not None
         ):
 
             return max(
@@ -485,123 +673,26 @@ def kalshi_yes_probability(market):
                 min(
                     1.0,
                     (
-                        float(yes_bid_old)
-                        + float(yes_ask_old)
+                        float(old_bid)
+                        + float(old_ask)
                     ) / 200.0,
                 ),
             )
 
-        last_old = market.get(
+        old_last = market.get(
             "last_price"
         )
 
-        if last_old is not None:
+        if old_last is not None:
 
             return max(
                 0.0,
                 min(
                     1.0,
-                    float(last_old) / 100.0,
+                    float(old_last)
+                    / 100.0,
                 ),
             )
-
-    except (TypeError, ValueError):
-
-        pass
-
-    return None
-
-
-# ============================================================
-# TARGET DEL MERCADO
-# ============================================================
-
-def get_target_info(market):
-
-    strike_type = str(
-        market.get(
-            "strike_type",
-            ""
-        )
-    ).lower()
-
-    floor_value = market.get(
-        "floor_strike"
-    )
-
-    cap_value = market.get(
-        "cap_strike"
-    )
-
-    try:
-
-        if strike_type in {
-            "greater",
-            "greater_or_equal",
-        }:
-
-            if floor_value is not None:
-
-                return {
-                    "type": "single",
-                    "value": float(
-                        floor_value
-                    ),
-                }
-
-        if strike_type in {
-            "less",
-            "less_or_equal",
-        }:
-
-            if cap_value is not None:
-
-                return {
-                    "type": "single",
-                    "value": float(
-                        cap_value
-                    ),
-                }
-
-        if strike_type == "between":
-
-            if (
-                floor_value is not None
-                and cap_value is not None
-            ):
-
-                return {
-                    "type": "range",
-                    "floor": float(
-                        floor_value
-                    ),
-                    "cap": float(
-                        cap_value
-                    ),
-                }
-
-        # Compatibilidad adicional
-        for key in [
-            "custom_strike",
-            "strike",
-        ]:
-
-            value = market.get(key)
-
-            if value is not None:
-
-                try:
-
-                    return {
-                        "type": "single",
-                        "value": float(value),
-                    }
-
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    pass
 
     except (
         TypeError,
@@ -614,539 +705,19 @@ def get_target_info(market):
 
 
 # ============================================================
-# MEJOR ENTRADA
-# ============================================================
-
-def max_entry_price(probability):
-
-    return (
-        probability
-        / (
-            1.0
-            + MIN_EXPECTED_RETURN
-        )
-    )
-
-
-# ============================================================
-# OBTENER DATOS
-# ============================================================
-
-try:
-
-    btc = get_btc_data()
-
-    markets = get_kalshi_markets()
-
-    current_market = (
-        find_current_market(
-            markets
-        )
-    )
-
-    if current_market is None:
-
-        st.error(
-            "No hay un mercado BTC 15M activo."
-        )
-
-        st.stop()
-
-except Exception as exc:
-
-    st.error(
-        f"Error de conexión: {exc}"
-    )
-
-    st.stop()
-
-
-# ============================================================
-# MERCADO ACTUAL
-# ============================================================
-
-ticker = str(
-    current_market.get(
-        "ticker",
-        "",
-    )
-)
-
-close_time = market_close(
-    current_market
-)
-
-if close_time is not None:
-
-    remaining = max(
-        0.0,
-        (
-            close_time
-            - now_utc()
-        ).total_seconds(),
-    )
-
-else:
-
-    remaining = 0.0
-
-
-# ============================================================
-# SEÑAL BLOQUEADA POR VELA
-# ============================================================
-
-previous_ticker = (
-    st.session_state.get(
-        "locked_ticker"
-    )
-)
-
-if previous_ticker != ticker:
-
-    new_direction, new_probability = (
-        model_signal(btc)
-    )
-
-    st.session_state.locked_ticker = (
-        ticker
-    )
-
-    st.session_state.locked_direction = (
-        new_direction
-    )
-
-    st.session_state.locked_probability = (
-        new_probability
-    )
-
-
-direction = (
-    st.session_state.locked_direction
-)
-
-probability = float(
-    st.session_state.locked_probability
-)
-
-
-# ============================================================
-# KALSHI EN VIVO
-# ============================================================
-
-live_yes = kalshi_yes_probability(
-    current_market
-)
-
-if live_yes is None:
-    live_yes = 0.50
-
-live_sube = live_yes
-
-live_baja = (
-    1.0 - live_yes
-)
-
-live_direction = (
-    "SUBE"
-    if live_sube >= live_baja
-    else "BAJA"
-)
-
-
-# ============================================================
-# ALERTA DE GIRO
-# ============================================================
-
-previous_live_direction = (
-    st.session_state.get(
-        "previous_live_direction"
-    )
-)
-
-alert = None
-
-if (
-    previous_live_direction is not None
-    and previous_live_direction
-    != live_direction
-):
-
-    alert = (
-        "🚨 ALERTA DE GIRO: "
-        f"{previous_live_direction} "
-        f"→ {live_direction}"
-    )
-
-st.session_state.previous_live_direction = (
-    live_direction
-)
-
-
-# ============================================================
 # TARGET
 # ============================================================
 
-target_info = get_target_info(
-    current_market
-)
-
-current_btc_price = btc["price"]
-
-
-# ============================================================
-# MEJOR ENTRADA
-# ============================================================
-
-entry_limit = max_entry_price(
-    probability
-)
-
-if direction == "SUBE":
-
-    current_entry = live_sube
-
-else:
-
-    current_entry = live_baja
-
-
-if current_entry < (
-    entry_limit - 0.005
+def get_target_info(
+    market,
 ):
 
-    entry_status = (
-        "🟢 FAVORABLE"
+    floor_value = market.get(
+        "floor_strike"
     )
 
-elif current_entry <= (
-    entry_limit + 0.005
-):
-
-    entry_status = (
-        "🟡 EN LÍMITE"
+    cap_value = market.get(
+        "cap_strike"
     )
 
-else:
-
-    entry_status = (
-        "🔴 ESPERAR"
-    )
-
-
-# ============================================================
-# INTERFAZ
-# ============================================================
-
-signal_icon = (
-    "🟢"
-    if direction == "SUBE"
-    else "🔴"
-)
-
-st.title(
-    "₿ BTC 15 MIN — SIGNAL BOT"
-)
-
-st.caption(
-    "Señales informativas • "
-    "NO realiza compras automáticas"
-)
-
-
-st.markdown(
-    f"""
-    <div class="signal">
-        {signal_icon} {direction}
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-col1, col2 = st.columns(2)
-
-with col1:
-
-    st.metric(
-        "📊 Probabilidad",
-        f"{probability * 100:.1f}%",
-    )
-
-with col2:
-
-    st.metric(
-        "💪 Fuerza",
-        strength(probability),
-    )
-
-
-# ============================================================
-# MERCADO ACTUAL
-# ============================================================
-
-ny_time = "—"
-
-if close_time is not None:
-
-    ny_time = (
-        close_time
-        .astimezone(NY_TZ)
-        .strftime("%I:%M:%S %p")
-    )
-
-
-st.markdown(
-    f"""
-    <div class="box">
-        <b>⏱️ MERCADO ACTUAL</b><br>
-        Cierra en:
-        <b>{countdown(remaining)}</b><br>
-        Hora NY:
-        <b>{ny_time}</b><br>
-        <span class="small">
-        Ticker: {ticker}
-        </span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# KALSHI EN VIVO
-# ============================================================
-
-st.subheader(
-    "📊 KALSHI EN VIVO"
-)
-
-col1, col2 = st.columns(2)
-
-with col1:
-
-    st.metric(
-        "🟢 SUBE",
-        f"{live_sube * 100:.1f}%",
-    )
-
-with col2:
-
-    st.metric(
-        "🔴 BAJA",
-        f"{live_baja * 100:.1f}%",
-    )
-
-
-st.write(
-    "Dirección Kalshi en vivo: "
-    f"**{live_direction}**"
-)
-
-
-# ============================================================
-# TARGET KALSHI
-# ============================================================
-
-st.subheader(
-    "🎯 TARGET KALSHI"
-)
-
-if target_info is None:
-
-    st.write(
-        "Target: **No disponible**"
-    )
-
-elif target_info["type"] == "single":
-
-    target = target_info["value"]
-
-    st.write(
-        "Precio objetivo: "
-        f"**{money(target)}**"
-    )
-
-    difference = (
-        target
-        - current_btc_price
-    )
-
-    if difference >= 0:
-
-        st.write(
-            "BTC hasta target: "
-            f"**+{money(difference)}**"
-        )
-
-    else:
-
-        st.write(
-            "BTC hasta target: "
-            f"**{money(difference)}**"
-        )
-
-else:
-
-    floor_value = target_info["floor"]
-    cap_value = target_info["cap"]
-
-    st.write(
-        "Rango objetivo: "
-        f"**{money(floor_value)} — "
-        f"{money(cap_value)}**"
-    )
-
-
-st.write(
-    "BTC actual: "
-    f"**{money(current_btc_price)}**"
-)
-
-
-# ============================================================
-# MEJOR ENTRADA
-# ============================================================
-
-st.subheader(
-    "💰 MEJOR ENTRADA"
-)
-
-st.write(
-    "Probabilidad del modelo: "
-    f"**{probability * 100:.1f}%**"
-)
-
-st.write(
-    "Precio máximo sugerido: "
-    f"**{entry_limit * 100:.1f}¢**"
-)
-
-st.write(
-    "Precio actual de la dirección: "
-    f"**{current_entry * 100:.1f}¢**"
-)
-
-st.write(
-    f"### {entry_status}"
-)
-
-st.caption(
-    "Cálculo informativo. "
-    "No garantiza ganancias y no ejecuta órdenes."
-)
-
-
-# ============================================================
-# TAMAÑO SUGERIDO
-# ============================================================
-
-st.subheader(
-    "💵 TAMAÑO SUGERIDO"
-)
-
-st.write(
-    f"**{SUGGESTED_SIZE}%** del capital"
-)
-
-st.caption(
-    "Solo es una sugerencia informativa. "
-    "El bot NO ejecuta órdenes."
-)
-
-
-# ============================================================
-# RADAR
-# ============================================================
-
-if alert:
-
-    st.error(alert)
-
-else:
-
-    st.success(
-        "🟢 Radar: sin giro significativo"
-    )
-
-
-# ============================================================
-# PRÓXIMA VELA
-# ============================================================
-
-if remaining <= PREVIEW_SECONDS:
-
-    next_market = find_next_market(
-        markets,
-        current_market,
-    )
-
-    st.subheader(
-        "🔮 PRÓXIMA VELA"
-    )
-
-    preview_direction, preview_probability = (
-        model_signal(btc)
-    )
-
-    preview_icon = (
-        "🟢"
-        if preview_direction == "SUBE"
-        else "🔴"
-    )
-
-    st.info(
-        f"{preview_icon} "
-        f"{preview_direction} — "
-        f"{preview_probability * 100:.1f}%"
-    )
-
-    st.caption(
-        "Vista preliminar. "
-        "No cambia la señal actual."
-    )
-
-
-# ============================================================
-# DATOS BTC
-# ============================================================
-
-with st.expander(
-    "📈 Datos BTC"
-):
-
-    st.write(
-        f"1 min: {btc['c1']:+.4f}%"
-    )
-
-    st.write(
-        f"3 min: {btc['c3']:+.4f}%"
-    )
-
-    st.write(
-        f"5 min: {btc['c5']:+.4f}%"
-    )
-
-    st.write(
-        f"10 min: {btc['c10']:+.4f}%"
-    )
-
-    st.write(
-        f"15 min: {btc['c15']:+.4f}%"
-    )
-
-
-st.caption(
-    f"Actualización automática "
-    f"cada {REFRESH_SECONDS} segundos."
-)
-
-
-# ============================================================
-# ACTUALIZACIÓN
-# ============================================================
-
-time.sleep(
-    REFRESH_SECONDS
-)
-
-st.rerun()
+    strike
