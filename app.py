@@ -1,994 +1,1728 @@
-import math
+import os
 import time
+import math
+import threading
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import requests
-import streamlit as st
+from flask import Flask, jsonify, render_template_string
+
+app = Flask(__name__)
+
+KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
+KALSHI_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
+KALSHI_SERIES = "KXBTC15M"
+PAIR = "XBTUSD"
+REQUEST_TIMEOUT = 15
+
+_cache = {"data": None, "updated": 0}
+_cache_lock = threading.Lock()
+_signal_state = {"bucket": None, "signal": None}
+_signal_lock = threading.Lock()
 
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
-
-st.set_page_config(
-    page_title="BTC 15M Signal Bot",
-    page_icon="₿",
-    layout="centered",
-)
-
-NY = ZoneInfo("America/New_York")
-
-SERIES = "KXBTC15M"
-
-KALSHI_HOSTS = [
-    "https://external-api.kalshi.com/trade-api/v2",
-    "https://api.elections.kalshi.com/trade-api/v2",
-]
-
-REFRESH_SECONDS = 10
-PREVIEW_SECONDS = 180
-SUGGESTED_POSITION = 25
-MIN_EXPECTED_RETURN = 0.10
-
-
-# ============================================================
-# ESTILO
-# ============================================================
-
-st.markdown(
-    """
-    <style>
-    .block-container {
-        max-width: 700px;
-        padding-top: 1rem;
-        padding-left: 1rem;
-        padding-right: 1rem;
-    }
-
-    h1 {
-        font-size: 1.7rem !important;
-    }
-
-    h2 {
-        font-size: 1.25rem !important;
-    }
-
-    h3 {
-        font-size: 1.05rem !important;
-    }
-
-    .big-signal {
-        font-size: 2rem;
-        font-weight: 800;
-        text-align: center;
-        padding: 12px;
-        border-radius: 14px;
-        margin: 8px 0;
-    }
-
-    .green {
-        background: rgba(0, 180, 80, 0.12);
-        border: 1px solid rgba(0, 180, 80, 0.4);
-    }
-
-    .red {
-        background: rgba(220, 50, 50, 0.12);
-        border: 1px solid rgba(220, 50, 50, 0.4);
-    }
-
-    .card {
-        padding: 12px;
-        border-radius: 12px;
-        border: 1px solid rgba(128,128,128,.25);
-        margin-bottom: 10px;
-    }
-
-    .small {
-        font-size: 0.85rem;
-        opacity: .8;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# FUNCIONES GENERALES
-# ============================================================
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def parse_dt(value):
-    if not value:
-        return None
-
+def safe_float(value, default=0.0):
     try:
-        if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(value, tz=timezone.utc)
-
-        value = str(value)
-
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
-
-        dt = datetime.fromisoformat(value)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        return dt.astimezone(timezone.utc)
-
-    except Exception:
-        return None
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
 
 
-def fmt_money(value):
-    if value is None:
-        return "—"
-
-    return f"${value:,.2f}"
-
-
-def fmt_pct(value):
-    if value is None:
-        return "—"
-
-    return f"{value * 100:.1f}%"
-
-
-def countdown(seconds):
-    if seconds is None:
-        return "—"
-
-    seconds = max(0, int(seconds))
-
-    minutes = seconds // 60
-    secs = seconds % 60
-
-    return f"{minutes:02d}:{secs:02d}"
-
-
-# ============================================================
-# KRAKEN
-# ============================================================
-
-@st.cache_data(ttl=8, show_spinner=False)
-def get_btc_ohlc():
-
-    url = "https://api.kraken.com/0/public/OHLC"
-
-    params = {
-        "pair": "XBTUSD",
-        "interval": 1,
-    }
-
+def get_candles(interval=15):
     try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+        response = requests.get(
+            KRAKEN_URL,
+            params={"pair": PAIR, "interval": interval},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
 
-        data = r.json()
+        if payload.get("error"):
+            raise RuntimeError(str(payload["error"]))
 
-        if data.get("error"):
-            return []
-
-        result = data.get("result", {})
-
-        pair_key = None
-
-        for key in result:
-            if key != "last":
-                pair_key = key
-                break
+        result = payload.get("result", {})
+        pair_key = next((key for key in result if key != "last"), None)
 
         if not pair_key:
-            return []
+            raise RuntimeError("Kraken no devolvió velas BTC.")
 
-        candles = result[pair_key]
+        candles = []
 
-        output = []
+        for row in result[pair_key]:
+            candles.append({
+                "time": int(row[0]),
+                "open": safe_float(row[1]),
+                "high": safe_float(row[2]),
+                "low": safe_float(row[3]),
+                "close": safe_float(row[4]),
+                "volume": safe_float(row[6]),
+            })
 
-        for candle in candles:
+        return candles
 
-            try:
-                output.append(
-                    {
-                        "time": datetime.fromtimestamp(
-                            float(candle[0]),
-                            tz=timezone.utc,
-                        ),
-                        "open": float(candle[1]),
-                        "high": float(candle[2]),
-                        "low": float(candle[3]),
-                        "close": float(candle[4]),
-                    }
-                )
-            except Exception:
-                continue
-
-        return output
-
-    except Exception:
+    except Exception as exc:
+        print("ERROR KRAKEN:", repr(exc))
         return []
 
 
-def price_at_or_before(candles, target):
+def ema(values, period):
+    if len(values) < period:
+        return []
 
-    valid = [
-        c for c in candles
-        if c["time"] <= target
+    multiplier = 2 / (period + 1)
+    current = sum(values[:period]) / period
+
+    output = [None] * (period - 1) + [current]
+
+    for value in values[period:]:
+        current = (
+            value * multiplier
+            + current * (1 - multiplier)
+        )
+        output.append(current)
+
+    return output
+
+
+def rsi(values, period=14):
+    if len(values) <= period:
+        return None
+
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
     ]
 
-    if not valid:
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(changes)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain else 50.0
+
+    return round(
+        100 - 100 / (1 + avg_gain / avg_loss),
+        2
+    )
+
+
+def macd(values):
+    if len(values) < 35:
         return None
 
-    return valid[-1]["close"]
+    fast = ema(values, 12)
+    slow = ema(values, 26)
 
-
-def percent_change(old, new):
-
-    if old is None or new is None or old == 0:
-        return 0.0
-
-    return (new - old) / old
-
-
-# ============================================================
-# MODELO
-# ============================================================
-
-def calculate_model(candles, market_open):
-
-    if not candles:
-        return None
-
-    # MUY IMPORTANTE:
-    # Solo usamos información ANTERIOR a la apertura
-    # de la vela actual.
-
-    previous = [
-        c for c in candles
-        if c["time"] < market_open
+    series = [
+        a - b
+        for a, b in zip(fast, slow)
+        if a is not None and b is not None
     ]
 
-    if len(previous) < 20:
+    if len(series) < 9:
         return None
 
-    latest = previous[-1]
+    signal = ema(series, 9)
 
-    p1 = price_at_or_before(
-        previous,
-        latest["time"].replace(second=0, microsecond=0)
+    return round(series[-1] - signal[-1], 4)
+
+
+def candle_shape(candle):
+    body = abs(candle["close"] - candle["open"])
+    full_range = candle["high"] - candle["low"]
+
+    upper = (
+        candle["high"]
+        - max(candle["open"], candle["close"])
     )
 
-    p3 = price_at_or_before(
-        previous,
-        latest["time"] - __import__("datetime").timedelta(minutes=3)
+    lower = (
+        min(candle["open"], candle["close"])
+        - candle["low"]
     )
 
-    p5 = price_at_or_before(
-        previous,
-        latest["time"] - __import__("datetime").timedelta(minutes=5)
+    ratio = body / full_range if full_range > 0 else 1
+
+    return body, full_range, upper, lower, ratio
+
+
+# ==========================================================
+# DOJI INTELLIGENCE
+# ==========================================================
+
+def analyze_doji(candles):
+
+    if len(candles) < 3:
+        return {
+            "detected": False,
+            "direction": "NEUTRAL",
+            "status": "ESPERANDO DATOS",
+            "description": "Datos insuficientes"
+        }
+
+    # Analizar las dos últimas velas cerradas.
+    doji = candles[-3]
+    confirmation = candles[-2]
+
+    _, candle_range, upper, lower, body_ratio = (
+        candle_shape(doji)
     )
 
-    p10 = price_at_or_before(
-        previous,
-        latest["time"] - __import__("datetime").timedelta(minutes=10)
-    )
+    if candle_range <= 0 or body_ratio > 0.10:
+        return {
+            "detected": False,
+            "direction": "NEUTRAL",
+            "status": "SIN DOJI",
+            "description": "No se detecta DOJI en la última vela cerrada"
+        }
 
-    p15 = price_at_or_before(
-        previous,
-        latest["time"] - __import__("datetime").timedelta(minutes=15)
-    )
+    # CONFIRMACION ALCISTA
+    if confirmation["close"] > doji["high"]:
 
-    c1 = percent_change(p1, latest["close"])
-    c3 = percent_change(p3, latest["close"])
-    c5 = percent_change(p5, latest["close"])
-    c10 = percent_change(p10, latest["close"])
-    c15 = percent_change(p15, latest["close"])
+        direction = "ALCISTA"
+        status = "DOJI ALCISTA CONFIRMADO"
 
-    score = (
-        c1 * 0.10
-        + c3 * 0.20
-        + c5 * 0.25
-        + c10 * 0.25
-        + c15 * 0.20
-    )
+        description = (
+            "La vela siguiente rompió el máximo del DOJI."
+        )
 
-    momentum = (
-        c1 * 0.30
-        + c3 * 0.30
-        + c5 * 0.40
-    )
+    # CONFIRMACION BAJISTA
+    elif confirmation["close"] < doji["low"]:
 
-    score += momentum * 0.25
+        direction = "BAJISTA"
+        status = "DOJI BAJISTA CONFIRMADO"
 
-    probability = 0.50 + abs(score) * 12
+        description = (
+            "La vela siguiente rompió el mínimo del DOJI."
+        )
 
-    probability = max(0.55, min(0.84, probability))
-
-    if score >= 0:
-        direction = "SUBE"
     else:
-        direction = "BAJA"
+
+        direction = "NEUTRAL"
+        status = "DOJI: ESPERAR"
+
+        description = (
+            "Todavía no hay ruptura del máximo ni del mínimo del DOJI."
+        )
 
     return {
+        "detected": True,
         "direction": direction,
-        "probability": probability,
-        "score": score,
-        "price": latest["close"],
-        "c1": c1,
-        "c3": c3,
-        "c5": c5,
-        "c10": c10,
-        "c15": c15,
+        "status": status,
+        "description": description,
+        "high": round(doji["high"], 2),
+        "low": round(doji["low"], 2),
+        "upper_wick": round(upper, 2),
+        "lower_wick": round(lower, 2),
     }
 
 
-def strength(probability):
+# ==========================================================
+# PATRONES DE VELAS
+# ==========================================================
 
-    if probability >= 0.70:
-        return "FUERTE"
+def candle_pattern(candles):
 
-    if probability >= 0.62:
-        return "MEDIA"
+    if len(candles) < 2:
+        return "INDEFINIDO", "NEUTRAL"
 
-    return "BAJA"
+    candle = candles[-2]
 
-
-# ============================================================
-# KALSHI
-# ============================================================
-
-def get_markets():
-
-    for host in KALSHI_HOSTS:
-
-        url = f"{host}/markets"
-
-        params = {
-            "series_ticker": SERIES,
-            "status": "open",
-            "limit": 100,
-        }
-
-        try:
-            r = requests.get(
-                url,
-                params=params,
-                timeout=10,
-            )
-
-            if r.status_code != 200:
-                continue
-
-            data = r.json()
-
-            markets = data.get("markets", [])
-
-            if markets:
-                return markets
-
-        except Exception:
-            continue
-
-    return []
-
-
-def get_current_market(markets):
-
-    current = now_utc()
-
-    candidates = []
-
-    for market in markets:
-
-        ticker = market.get("ticker")
-
-        if not ticker:
-            continue
-
-        open_time = parse_dt(
-            market.get("open_time")
-        )
-
-        close_time = parse_dt(
-            market.get("close_time")
-        )
-
-        if not open_time or not close_time:
-            continue
-
-        if open_time <= current < close_time:
-            candidates.append(
-                (
-                    open_time,
-                    close_time,
-                    market,
-                )
-            )
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True,
+    body, full_range, upper, lower, ratio = (
+        candle_shape(candle)
     )
 
-    return candidates[0][2]
-
-
-def get_next_market(markets, current_ticker=None):
-
-    current = now_utc()
-
-    candidates = []
-
-    for market in markets:
-
-        ticker = market.get("ticker")
-
-        if not ticker:
-            continue
-
-        if ticker == current_ticker:
-            continue
-
-        open_time = parse_dt(
-            market.get("open_time")
-        )
-
-        if not open_time:
-            continue
-
-        if open_time > current:
-            candidates.append(
-                (open_time, market)
-            )
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x: x[0]
-    )
-
-    return candidates[0][1]
-
-
-def dollar_to_probability(value):
-
-    if value is None:
-        return None
-
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-def get_kalshi_probability(market):
-
-    yes_bid = dollar_to_probability(
-        market.get("yes_bid_dollars")
-    )
-
-    yes_ask = dollar_to_probability(
-        market.get("yes_ask_dollars")
-    )
-
-    last = dollar_to_probability(
-        market.get("last_price_dollars")
-    )
-
-    if yes_bid is not None and yes_ask is not None:
-        probability = (
-            yes_bid + yes_ask
-        ) / 2
-
-    elif last is not None:
-        probability = last
-
-    elif yes_bid is not None:
-        probability = yes_bid
-
-    elif yes_ask is not None:
-        probability = yes_ask
-
-    else:
-        return None
-
-    return max(0.0, min(1.0, probability))
-
-
-# ============================================================
-# OBJETIVO
-# ============================================================
-
-def get_target(market):
-
-    floor = market.get("floor_strike")
-    cap = market.get("cap_strike")
-    custom = market.get("custom_strike")
-    strike = market.get("strike")
-
-    for value in [custom, strike, cap, floor]:
-
-        if value is not None:
-
-            try:
-                return float(value)
-            except Exception:
-                pass
-
-    return None
-
-
-# ============================================================
-# SEÑAL FIJA
-# ============================================================
-
-@st.cache_data(
-    show_spinner=False,
-    ttl=900,
-)
-def fixed_signal(ticker, open_time_iso):
-
-    market_open = parse_dt(open_time_iso)
-
-    candles = get_btc_ohlc()
-
-    result = calculate_model(
-        candles,
-        market_open,
-    )
-
-    if result is None:
-
-        return {
-            "direction": "SUBE",
-            "probability": 0.55,
-            "score": 0,
-            "price": None,
-        }
-
-    return result
-
-
-# ============================================================
-# ENTRADA
-# ============================================================
-
-def calculate_max_entry(model_probability):
-
-    if model_probability is None:
-        return None
-
-    return model_probability / (
-        1 + MIN_EXPECTED_RETURN
-    )
-
-
-# ============================================================
-# ALERTA
-# ============================================================
-
-def live_kalshi_direction(probability):
-
-    if probability is None:
-        return None
-
-    if probability >= 0.50:
-        return "SUBE"
-
-    return "BAJA"
-
-
-# ============================================================
-# UI PRINCIPAL
-# ============================================================
-
-st.title("₿ BTC 15M Signal Bot")
-
-st.caption(
-    "Señales solamente • Sin compras automáticas"
-)
-
-
-@st.fragment(run_every=REFRESH_SECONDS)
-def live_dashboard():
-
-    markets = get_markets()
-
-    if not markets:
-
-        st.error(
-            "No se pudieron obtener los mercados de Kalshi."
-        )
-
-        st.stop()
-
-    market = get_current_market(markets)
-
-    if not market:
-
-        st.warning(
-            "No hay una vela BTC 15M activa en este momento."
-        )
-
-        next_market = get_next_market(markets)
-
-        if next_market:
-
-            next_open = parse_dt(
-                next_market.get("open_time")
-            )
-
-            if next_open:
-
-                st.info(
-                    "Próxima vela: "
-                    + next_open.astimezone(NY).strftime(
-                        "%I:%M:%S %p"
-                    )
-                )
-
-        st.stop()
-
-    ticker = market.get("ticker")
-
-    open_time = parse_dt(
-        market.get("open_time")
-    )
-
-    close_time = parse_dt(
-        market.get("close_time")
-    )
-
-    if not open_time or not close_time:
-
-        st.error(
-            "El mercado no tiene horarios válidos."
-        )
-
-        st.stop()
-
-    # --------------------------------------------------------
-    # SEÑAL FIJA
-    # --------------------------------------------------------
-
-    signal = fixed_signal(
-        ticker,
-        open_time.isoformat(),
-    )
-
-    direction = signal["direction"]
-    probability = signal["probability"]
-
-    # --------------------------------------------------------
-    # TIEMPO
-    # --------------------------------------------------------
-
-    current = now_utc()
-
-    remaining = (
-        close_time - current
-    ).total_seconds()
-
-    elapsed = (
-        current - open_time
-    ).total_seconds()
-
-    # --------------------------------------------------------
-    # BTC ACTUAL
-    # --------------------------------------------------------
-
-    candles = get_btc_ohlc()
-
-    btc_current = None
-
-    if candles:
-
-        btc_current = candles[-1]["close"]
-
-    # --------------------------------------------------------
-    # KALSHI LIVE
-    # --------------------------------------------------------
-
-    kalshi_prob = get_kalshi_probability(
-        market
-    )
-
-    kalshi_direction = live_kalshi_direction(
-        kalshi_prob
-    )
-
-    # --------------------------------------------------------
-    # TARGET
-    # --------------------------------------------------------
-
-    target = get_target(market)
-
-    # --------------------------------------------------------
-    # ENTRADA
-    # --------------------------------------------------------
-
-    max_entry = calculate_max_entry(
-        probability
-    )
-
-    live_direction_price = None
-
-    if kalshi_prob is not None:
-
-        if direction == "SUBE":
-            live_direction_price = kalshi_prob
-        else:
-            live_direction_price = 1 - kalshi_prob
-
-    # --------------------------------------------------------
-    # ALERTA
-    # --------------------------------------------------------
+    if full_range <= 0:
+        return "INDEFINIDO", "NEUTRAL"
+
+    if ratio <= 0.10:
+        return "DOJI", "NEUTRAL"
 
     if (
-        kalshi_direction
-        and kalshi_direction != direction
+        lower >= body * 2
+        and upper <= body * 0.7
+        and candle["close"] > candle["open"]
     ):
+        return "MARTILLO", "ALCISTA"
 
-        st.warning(
-            f"🚨 ALERTA DE GIRO\n\n"
-            f"{direction} → {kalshi_direction}"
-        )
+    if (
+        upper >= body * 2
+        and lower <= body * 0.7
+        and candle["close"] < candle["open"]
+    ):
+        return "ESTRELLA FUGAZ", "BAJISTA"
 
-    # --------------------------------------------------------
-    # SEÑAL PRINCIPAL
-    # --------------------------------------------------------
+    if candle["close"] > candle["open"]:
+        return "VELA ALCISTA", "ALCISTA"
 
-    if direction == "SUBE":
+    if candle["close"] < candle["open"]:
+        return "VELA BAJISTA", "BAJISTA"
 
-        st.markdown(
-            """
-            <div class="big-signal green">
-            🟢 SUBE
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    return "INDEFINIDO", "NEUTRAL"
 
-    else:
 
-        st.markdown(
-            """
-            <div class="big-signal red">
-            🔴 BAJA
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+# ==========================================================
+# TENDENCIA MULTI-TIEMPO
+# ==========================================================
 
-    st.markdown(
-        f"""
-        <div class="card">
-        <b>📈 Probabilidad del modelo:</b>
-        {probability * 100:.1f}%<br>
+def trend_for(interval):
 
-        <b>💪 Fuerza:</b>
-        {strength(probability)}<br>
+    candles = get_candles(interval)
 
-        <b>⏱️ Cierra en:</b>
-        {countdown(remaining)}<br>
-
-        <b>🕐 Cierre NY:</b>
-        {close_time.astimezone(NY).strftime("%I:%M:%S %p")}<br>
-
-        <span class="small">
-        Mercado: {ticker}
-        </span>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    closes = (
+        [c["close"] for c in candles[:-1]]
+        if len(candles) > 1 else []
     )
 
-    # --------------------------------------------------------
-    # KALSHI
-    # --------------------------------------------------------
+    e5 = ema(closes, 5)
+    e13 = ema(closes, 13)
+    e21 = ema(closes, 21)
 
-    st.subheader("📊 Kalshi en vivo")
+    if not e5 or not e13 or not e21:
+        return "SIN DATOS"
 
-    if kalshi_prob is not None:
+    if e5[-1] > e13[-1] > e21[-1]:
+        return "SUBE"
 
-        st.write(
-            f"🟢 SUBE: **{kalshi_prob * 100:.1f}%**"
+    if e5[-1] < e13[-1] < e21[-1]:
+        return "BAJA"
+
+    return "NEUTRAL"
+
+
+# ==========================================================
+# MOTOR DE SEÑALES
+# ==========================================================
+
+def make_signal(candles, indicators, doji_info):
+
+    if len(candles) < 35:
+        return {
+            "direction": "ESPERAR",
+            "probability": 50,
+            "reason": "Esperando suficientes velas."
+        }
+
+    score = 0
+
+    e5 = indicators["ema5"]
+    e13 = indicators["ema13"]
+    e21 = indicators["ema21"]
+
+    if e5 and e13:
+        score += 1 if e5 > e13 else -1 if e5 < e13 else 0
+
+    if e13 and e21:
+        score += 1 if e13 > e21 else -1 if e13 < e21 else 0
+
+    value_rsi = indicators["rsi"]
+
+    if value_rsi is not None:
+        score += (
+            1 if value_rsi >= 55
+            else -1 if value_rsi <= 45
+            else 0
         )
 
-        st.write(
-            f"🔴 BAJA: **{(1 - kalshi_prob) * 100:.1f}%**"
-        )
+    value_macd = indicators["macd"]
 
-        st.write(
-            f"Dirección actual de Kalshi: "
-            f"**{kalshi_direction}**"
-        )
+    if value_macd is not None:
+        score += 1 if value_macd > 0 else -1 if value_macd < 0 else 0
 
-    else:
+    closed = [c["close"] for c in candles[:-1]]
 
-        st.write(
-            "No hay precio disponible."
-        )
+    if len(closed) > 5:
+        change = closed[-1] - closed[-6]
+        score += 1 if change > 0 else -1 if change < 0 else 0
 
-    # --------------------------------------------------------
-    # BTC
-    # --------------------------------------------------------
+    if (
+        doji_info["detected"]
+        and doji_info["direction"] == "NEUTRAL"
+    ):
+        return {
+            "direction": "ESPERAR",
+            "probability": 50,
+            "reason": "DOJI detectado: esperar ruptura de su máximo o mínimo."
+        }
 
-    st.subheader("₿ BTC")
+    if (
+        doji_info["detected"]
+        and doji_info["direction"] == "ALCISTA"
+    ):
+        score += 1
 
-    if btc_current is not None:
+    elif (
+        doji_info["detected"]
+        and doji_info["direction"] == "BAJISTA"
+    ):
+        score -= 1
 
-        st.write(
-            f"BTC actual: **{fmt_money(btc_current)}**"
-        )
+    if score >= 3:
+        return {
+            "direction": "SUBE",
+            "probability": min(80, 55 + score * 4),
+            "reason": "Indicadores con inclinación alcista."
+        }
 
-    if target is not None:
+    if score <= -3:
+        return {
+            "direction": "BAJA",
+            "probability": min(80, 55 + abs(score) * 4),
+            "reason": "Indicadores con inclinación bajista."
+        }
 
-        st.write(
-            f"🎯 Precio objetivo: "
-            f"**{fmt_money(target)}**"
-        )
+    return {
+        "direction": "ESPERAR",
+        "probability": 50,
+        "reason": "Señales mixtas; esperar confirmación."
+    }
 
-        if btc_current is not None:
 
-            difference = btc_current - target
+# ==========================================================
+# BLOQUEO DE SEÑAL POR VELA DE 15 MINUTOS
+# ==========================================================
 
-            if difference >= 0:
+def fixed_signal(candles, indicators, doji_info):
 
-                st.write(
-                    f"BTC sobre objetivo: "
-                    f"**+${abs(difference):,.2f}**"
-                )
+    bucket = int(time.time()) // 900
 
-            else:
+    with _signal_lock:
 
-                st.write(
-                    f"BTC hasta objetivo: "
-                    f"**-${abs(difference):,.2f}**"
-                )
+        if _signal_state["bucket"] != bucket:
 
-    # --------------------------------------------------------
-    # MEJOR ENTRADA
-    # --------------------------------------------------------
+            _signal_state["bucket"] = bucket
 
-    st.subheader("💰 MEJOR ENTRADA")
-
-    if max_entry is not None:
-
-        st.write(
-            f"Probabilidad modelo: "
-            f"**{probability * 100:.1f}%**"
-        )
-
-        st.write(
-            f"Entrada máxima sugerida: "
-            f"**{max_entry * 100:.1f}¢**"
-        )
-
-        if live_direction_price is not None:
-
-            st.write(
-                f"Precio actual de dirección: "
-                f"**{live_direction_price * 100:.1f}¢**"
+            _signal_state["signal"] = make_signal(
+                candles,
+                indicators,
+                doji_info
             )
 
-            if live_direction_price <= max_entry:
+        return _signal_state["signal"]
 
-                st.success(
-                    "✅ ENTRADA FAVORABLE"
-                )
 
-            else:
+# ==========================================================
+# CONSTRUIR DASHBOARD
+# ==========================================================
 
-                st.info(
-                    "⏳ ESPERAR MEJOR PRECIO"
-                )
+def build_dashboard():
 
-    # --------------------------------------------------------
-    # POSICIÓN
-    # --------------------------------------------------------
+    candles = get_candles(15)
 
-    st.subheader("📊 Tamaño sugerido")
+    if len(candles) < 35:
+        return {
+            "error": "Kraken no devolvió suficientes velas. Intenta actualizar en unos segundos."
+        }
 
-    st.write(
-        f"**{SUGGESTED_POSITION}%** "
-        "del capital destinado a esta operación"
+    closed = candles[:-1]
+
+    closes = [c["close"] for c in closed]
+
+    e5 = ema(closes, 5)
+    e13 = ema(closes, 13)
+    e21 = ema(closes, 21)
+
+    value_rsi = rsi(closes)
+    value_macd = macd(closes)
+
+    doji_info = analyze_doji(candles)
+
+    pattern_name, pattern_direction = candle_pattern(candles)
+
+    indicator_data = {
+
+        "ema5": round(e5[-1], 2) if e5 else None,
+
+        "ema13": round(e13[-1], 2) if e13 else None,
+
+        "ema21": round(e21[-1], 2) if e21 else None,
+
+        "rsi": value_rsi,
+
+        "macd": value_macd,
+
+        "momentum": round(
+            (closes[-1] - closes[-6]) / closes[-6] * 100,
+            5
+        ) if len(closes) > 6 and closes[-6] else 0,
+
+        "volume": "ALTO" if (
+            len(closed) > 21
+            and closed[-1]["volume"] >
+            sum(c["volume"] for c in closed[-21:-1]) / 20 * 1.8
+        ) else "BAJO" if (
+            len(closed) > 21
+            and closed[-1]["volume"] <
+            sum(c["volume"] for c in closed[-21:-1]) / 20 * 0.6
+        ) else "NORMAL",
+    }
+
+    signal = fixed_signal(
+        candles,
+        indicator_data,
+        doji_info
     )
 
-    st.caption(
-        "Esto es una sugerencia de gestión de riesgo. "
-        "No realiza ninguna compra."
+    strength = 0.0
+
+    if e5 and e21 and e21[-1]:
+        strength = round(
+            min(abs(e5[-1] - e21[-1]) / e21[-1] * 2000, 100),
+            1
+        )
+
+    recent = closed[-60:]
+
+    lows = sorted(c["low"] for c in recent)
+    highs = sorted(c["high"] for c in recent)
+
+    ranges = [
+        c["high"] - c["low"]
+        for c in closed[-15:]
+    ]
+
+    avg_range = (
+        sum(ranges) / len(ranges)
+        if ranges else 0
     )
 
-    # --------------------------------------------------------
-    # RADAR
-    # --------------------------------------------------------
+    direction = (
+        1 if indicator_data["momentum"] >= 0 else -1
+    )
 
-    st.subheader("🚨 Radar")
+    current_price = candles[-1]["close"]
 
-    if kalshi_direction == direction:
+    chart_candles = candles[-100:]
 
-        st.success(
-            "Sin giro significativo."
-        )
+    def line(series):
 
-    elif kalshi_direction:
-
-        st.warning(
-            f"Kalshi está mostrando {kalshi_direction} "
-            f"mientras la señal fija es {direction}."
-        )
-
-    # --------------------------------------------------------
-    # PRÓXIMA VELA
-    # --------------------------------------------------------
-
-    if remaining <= PREVIEW_SECONDS:
-
-        st.subheader("🔮 PRÓXIMA VELA")
-
-        next_market = get_next_market(
-            markets,
-            ticker,
-        )
-
-        if next_market:
-
-            next_ticker = next_market.get(
-                "ticker"
+        return (
+            [None] * max(
+                0,
+                len(chart_candles) - len(series[-len(chart_candles):])
             )
+            + [
+                round(v, 2) if v is not None else None
+                for v in series[-len(chart_candles):]
+            ]
+        )
 
-            next_open = parse_dt(
-                next_market.get("open_time")
-            )
+    now = int(time.time())
+    remaining = 900 - (now % 900)
 
-            if next_open:
+    return {
 
-                next_signal = fixed_signal(
-                    next_ticker,
-                    next_open.isoformat(),
+        "price": round(current_price, 2),
+
+        "signal": signal,
+
+        "strength": strength,
+
+        "indicators": indicator_data,
+
+        "doji": doji_info,
+
+        "pattern": {
+            "name": pattern_name,
+            "direction": pattern_direction
+        },
+
+        "levels": {
+
+            "support1": round(lows[0], 2),
+
+            "support2": round(
+                lows[min(3, len(lows)-1)], 2
+            ),
+
+            "resistance1": round(highs[-1], 2),
+
+            "resistance2": round(
+                highs[max(0, len(highs)-4)], 2
+            ),
+        },
+
+        "projections": {
+
+            "conservative": round(
+                current_price + direction * avg_range * 0.5, 2
+            ),
+
+            "average": round(
+                current_price + direction * avg_range, 2
+            ),
+
+            "optimistic": round(
+                current_price + direction * avg_range * 1.5, 2
+            ),
+        },
+
+        "timeframes": {
+            "1M": trend_for(1),
+            "5M": trend_for(5),
+            "15M": trend_for(15)
+        },
+
+        "ohlc": {
+            key: round(candles[-1][key], 2)
+            for key in ("open", "high", "low", "close")
+        },
+
+        "candles": chart_candles,
+
+        "ema5_series": line(
+            ema([c["close"] for c in candles], 5)
+        ),
+
+        "ema13_series": line(
+            ema([c["close"] for c in candles], 13)
+        ),
+
+        "ema21_series": line(
+            ema([c["close"] for c in candles], 21)
+        ),
+
+        "remaining": (
+            f"{remaining // 60:02d}:{remaining % 60:02d}"
+        ),
+
+        "updated": datetime.now(
+            timezone.utc
+        ).strftime("%H:%M:%S UTC"),
+    }
+
+
+# ==========================================================
+# KALSHI
+# ==========================================================
+
+def get_kalshi_markets():
+
+    try:
+
+        response = requests.get(
+            f"{KALSHI_BASE_URL}/markets",
+
+            params={
+                "series_ticker": KALSHI_SERIES,
+                "status": "open",
+                "limit": 100
+            },
+
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        markets = response.json().get("markets", [])
+
+        results = []
+
+        for market in markets:
+
+            def cents(field):
+
+                dollars = market.get(field)
+
+                if dollars in (None, ""):
+                    return None
+
+                return round(
+                    safe_float(dollars) * 100,
+                    2
                 )
 
-                if next_signal:
+            results.append({
 
-                    next_direction = (
-                        next_signal["direction"]
-                    )
+                "ticker": market.get("ticker"),
 
-                    next_probability = (
-                        next_signal["probability"]
-                    )
+                "title": market.get("title"),
 
-                    st.info(
-                        f"Preliminar: "
-                        f"**{next_direction}** — "
-                        f"{next_probability * 100:.1f}%"
-                    )
+                "status": market.get("status"),
 
-                    st.caption(
-                        "Esta señal es preliminar. "
-                        "No reemplaza la señal actual "
-                        "hasta que comience la nueva vela."
-                    )
+                "yes_bid": cents("yes_bid_dollars"),
 
-    # --------------------------------------------------------
-    # ACTUALIZACIÓN
-    # --------------------------------------------------------
+                "yes_ask": cents("yes_ask_dollars"),
 
-    st.caption(
-        f"Actualización automática cada "
-        f"{REFRESH_SECONDS} segundos."
+                "no_bid": cents("no_bid_dollars"),
+
+                "no_ask": cents("no_ask_dollars"),
+            })
+
+        return {
+            "connected": True,
+            "count": len(results),
+            "markets": results,
+            "error": None
+        }
+
+    except Exception as exc:
+
+        print("ERROR KALSHI:", repr(exc))
+
+        return {
+            "connected": False,
+            "count": 0,
+            "markets": [],
+            "error": str(exc)
+        }
+
+
+# ==========================================================
+# HTML DASHBOARD
+# ==========================================================
+
+HTML = r"""
+<!doctype html>
+<html lang="es">
+<head>
+
+<meta charset="utf-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>BTC 15M Candle Calculator PRO AI</title>
+
+<script src="https://unpkg.com/lightweight-charts@4.2.2/dist/lightweight-charts.standalone.production.js"></script>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 10px;
+    background: #050a12;
+    color: #f4f7fb;
+    font-family: Arial, sans-serif;
+}
+
+.container {
+    max-width: 1450px;
+    margin: auto;
+}
+
+.panel {
+    background: #101b2c;
+    border: 1px solid #29415d;
+    border-radius: 13px;
+    padding: 15px;
+    margin-bottom: 11px;
+}
+
+.header {
+    font-size: 22px;
+    font-weight: bold;
+    color: #45b5ff;
+}
+
+.sub {
+    color: #00e6a0;
+    font-size: 13px;
+    margin-top: 8px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 9px;
+}
+
+.metric {
+    background: #17253a;
+    border: 1px solid #263b55;
+    border-radius: 10px;
+    padding: 13px;
+    min-width: 0;
+}
+
+.label {
+    color: #91a9c7;
+    font-size: 13px;
+}
+
+.metric strong {
+    display: block;
+    font-size: 18px;
+    margin-top: 8px;
+    overflow-wrap: anywhere;
+}
+
+.title {
+    font-size: 17px;
+    font-weight: bold;
+    margin-bottom: 12px;
+}
+
+.signal {
+    text-align: center;
+    font-size: 34px;
+    font-weight: bold;
+    margin: 14px;
+}
+
+.up, .bull {
+    color: #00efa0;
+}
+
+.down, .bear {
+    color: #ff526b;
+}
+
+.wait, .neutral {
+    color: #ffd34e;
+}
+
+.row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid #26364c;
+    overflow-wrap: anywhere;
+}
+
+#chart {
+    height: 330px;
+    width: 100%;
+}
+
+.statusbox {
+    border: 1px solid currentColor;
+    border-radius: 9px;
+    padding: 12px;
+    margin-top: 10px;
+    font-weight: bold;
+}
+
+.conclusion {
+    color: #00efa0;
+    border-color: #00efa0;
+    box-shadow: 0 0 10px #00a96b;
+}
+
+.footer {
+    text-align: center;
+    color: #8499b6;
+    font-size: 12px;
+    padding: 15px;
+}
+
+@media(max-width: 800px) {
+
+    .grid {
+        grid-template-columns: 1fr;
+    }
+
+    .metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    #chart {
+        height: 290px;
+    }
+}
+
+</style>
+</head>
+
+<body>
+
+<main class="container">
+
+<section class="panel">
+
+<div class="header">
+₿ BTC 15M - CANDLE CALCULATOR PRO
+<span style="color:#d59aff">AI</span>
+</div>
+
+<div class="sub" id="connection">
+● CONECTANDO A KRAKEN...
+</div>
+
+</section>
+
+
+<section class="grid">
+
+<div class="panel">
+
+<div class="title">SEÑAL ACTUAL (15M)</div>
+
+<div class="label">Dirección del mercado</div>
+
+<div id="direction" class="signal wait">
+ESPERAR
+</div>
+
+<div id="probability" class="signal">
+50%
+</div>
+
+<div class="row">
+<span>Precio actual</span>
+<b id="price">--</b>
+</div>
+
+<div class="row">
+<span>Fuerza</span>
+<b id="strength">--</b>
+</div>
+
+<div class="row">
+<span>Tiempo restante</span>
+<b id="remaining">--</b>
+</div>
+
+<p id="reason">Analizando...</p>
+
+</div>
+
+
+<div class="panel">
+
+<div class="title">GRÁFICA BTC/USD - 15M</div>
+
+<div id="chart"></div>
+
+</div>
+
+
+<div class="panel">
+
+<div class="title">ANÁLISIS DE DOJI</div>
+
+<div id="doji-status" class="wait">
+ANALIZANDO
+</div>
+
+<div id="doji-box" class="statusbox neutral">
+Esperando patrón...
+</div>
+
+<div class="title" style="margin-top:18px">
+PATRÓN ACTUAL
+</div>
+
+<b id="pattern">--</b>
+
+</div>
+
+</section>
+
+
+<section class="panel">
+
+<div class="title">INDICADORES</div>
+
+<div class="metrics">
+
+<div class="metric">
+<span class="label">EMA 5</span>
+<strong id="ema5">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">EMA 13</span>
+<strong id="ema13">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">EMA 21</span>
+<strong id="ema21">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">RSI (14)</span>
+<strong id="rsi">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">MACD</span>
+<strong id="macd">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">MOMENTUM</span>
+<strong id="momentum">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">VOLUMEN</span>
+<strong id="volume">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">FUERZA</span>
+<strong id="strength2">--</strong>
+</div>
+
+</div>
+</section>
+
+
+<section class="panel">
+
+<div class="title">PROYECCIÓN DE CIERRE (15M)</div>
+
+<div class="metrics">
+
+<div class="metric">
+<span class="label">CONSERVADOR</span>
+<strong id="conservative">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">PROMEDIO</span>
+<strong id="average">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">OPTIMISTA</span>
+<strong id="optimistic">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">CIERRE ESTIMADO</span>
+<strong id="estimated">--</strong>
+</div>
+
+</div>
+</section>
+
+
+<section class="panel">
+
+<div class="title">VELAS OHLC - 15M</div>
+
+<div class="metrics">
+
+<div class="metric">
+<span class="label">OPEN</span>
+<strong id="open">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">HIGH</span>
+<strong id="high">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">LOW</span>
+<strong id="low">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">CLOSE</span>
+<strong id="close">--</strong>
+</div>
+
+</div>
+</section>
+
+
+<section class="panel">
+
+<div class="title">ANÁLISIS MULTI-TIEMPO</div>
+
+<div class="metrics">
+
+<div class="metric">
+<span class="label">1 MINUTO</span>
+<strong id="tf1">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">5 MINUTOS</span>
+<strong id="tf5">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">15 MINUTOS</span>
+<strong id="tf15">--</strong>
+</div>
+
+</div>
+</section>
+
+
+<section class="panel">
+
+<div class="title">NIVELES IMPORTANTES</div>
+
+<div class="row">
+<span>Resistencia 2</span>
+<b id="resistance2">--</b>
+</div>
+
+<div class="row">
+<span>Resistencia 1</span>
+<b id="resistance1">--</b>
+</div>
+
+<div class="row">
+<span>Soporte 1</span>
+<b id="support1">--</b>
+</div>
+
+<div class="row">
+<span>Soporte 2</span>
+<b id="support2">--</b>
+</div>
+
+</section>
+
+
+<section class="panel conclusion">
+
+<div class="title">CONCLUSIÓN DEL MERCADO</div>
+
+<b id="conclusion">Analizando...</b>
+
+</section>
+
+
+<section class="panel">
+
+<div class="title">KALSHI BTC 15M — EN VIVO</div>
+
+<div id="kalshi-connection" class="sub">
+● CONECTANDO A KALSHI...
+</div>
+
+<div class="metrics" style="margin-top:12px">
+
+<div class="metric">
+<span class="label">YES ASK</span>
+<strong id="yesask">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">NO ASK</span>
+<strong id="noask">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">YES BID</span>
+<strong id="yesbid">--</strong>
+</div>
+
+<div class="metric">
+<span class="label">NO BID</span>
+<strong id="nobid">--</strong>
+</div>
+
+</div>
+
+<div class="row">
+<span>Mercado</span>
+<b id="ticker">--</b>
+</div>
+
+<div class="row">
+<span>Estado</span>
+<b id="marketstatus">--</b>
+</div>
+
+<div class="row">
+<span>Actualización</span>
+<b id="kalshiupdated">--</b>
+</div>
+
+</section>
+
+
+<section class="panel" style="text-align:center;font-size:20px;font-weight:bold">
+
+SEÑAL FINAL (15M):
+
+<span id="finaldirection" class="wait">ESPERAR</span>
+
+—
+
+<span id="finalprob">50%</span>
+
+</section>
+
+
+<div class="footer">
+
+DATOS DE KRAKEN Y CONSULTA DE KALSHI
+
+<br>
+
+SOLO SEÑALES • SIN COMPRAS AUTOMÁTICAS
+
+<br>
+
+Las estimaciones no garantizan resultados futuros.
+
+<br>
+
+<span id="updated"></span>
+
+</div>
+
+</main>
+
+
+<script>
+
+const el = id => document.getElementById(id);
+
+const money = value => {
+
+    if (value === null || value === undefined) {
+        return "--";
+    }
+
+    return "$" + Number(value).toLocaleString(
+        "en-US",
+        {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        }
+    );
+};
+
+
+const set = (id, value) => {
+
+    if (el(id)) {
+        el(id).textContent =
+            value === null || value === undefined
+            ? "--"
+            : value;
+    }
+
+};
+
+
+const cls = direction => {
+
+    if (
+        direction === "SUBE"
+        || direction === "ALCISTA"
+    ) return "up";
+
+    if (
+        direction === "BAJA"
+        || direction === "BAJISTA"
+    ) return "down";
+
+    return "wait";
+};
+
+
+// ==========================================================
+// GRAFICA
+// ==========================================================
+
+const chart = LightweightCharts.createChart(
+    el("chart"),
+    {
+        width: el("chart").clientWidth,
+        height: 330,
+
+        layout: {
+            background: {
+                color: "#101b2c"
+            },
+            textColor: "#a9bfd9"
+        },
+
+        grid: {
+            vertLines: {
+                color: "#26384f"
+            },
+            horzLines: {
+                color: "#26384f"
+            }
+        },
+
+        timeScale: {
+            timeVisible: true
+        }
+    }
+);
+
+
+const candlesSeries = chart.addCandlestickSeries({
+
+    upColor: "#00e69a",
+    downColor: "#ff526b",
+
+    borderUpColor: "#00e69a",
+    borderDownColor: "#ff526b",
+
+    wickUpColor: "#00e69a",
+    wickDownColor: "#ff526b"
+
+});
+
+
+const l5 = chart.addLineSeries({
+    color: "#00e69a",
+    lineWidth: 1
+});
+
+const l13 = chart.addLineSeries({
+    color: "#ffc857",
+    lineWidth: 1
+});
+
+const l21 = chart.addLineSeries({
+    color: "#ff526b",
+    lineWidth: 1
+});
+
+
+window.addEventListener("resize", () => {
+
+    chart.applyOptions({
+        width: el("chart").clientWidth
+    });
+
+});
+
+
+function lineData(candles, values) {
+
+    return candles.map((candle, index) => {
+
+        const value = values[index];
+
+        if (value === null || value === undefined) {
+            return null;
+        }
+
+        return {
+            time: candle.time,
+            value: value
+        };
+
+    }).filter(Boolean);
+
+}
+
+
+// ==========================================================
+// ACTUALIZAR DASHBOARD
+// ==========================================================
+
+async function refresh() {
+
+    try {
+
+        const response = await fetch(
+            "/api/data",
+            {
+                cache: "no-store"
+            }
+        );
+
+        if (!response.ok) {
+            throw Error("HTTP " + response.status);
+        }
+
+        const data = await response.json();
+
+        if (data.error) {
+            throw Error(data.error);
+        }
+
+        const signal = data.signal;
+        const indicators = data.indicators;
+
+
+        set("connection", "● CONECTADO A KRAKEN");
+
+        el("connection").style.color = "#00e6a0";
+
+
+        // SEÑAL
+
+        set("direction", signal.direction);
+
+        el("direction").className =
+            "signal " + cls(signal.direction);
+
+        set(
+            "probability",
+            signal.probability + "%"
+        );
+
+
+        set("price", money(data.price));
+
+        set("strength", data.strength + "%");
+
+        set("strength2", data.strength + "%");
+
+        set("remaining", data.remaining);
+
+        set("reason", signal.reason);
+
+
+        // INDICADORES
+
+        ["ema5", "ema13", "ema21"].forEach(key => {
+
+            set(key, money(indicators[key]));
+
+        });
+
+        set("rsi", indicators.rsi);
+
+        set("macd", indicators.macd);
+
+        set("momentum", indicators.momentum + "%");
+
+        set("volume", indicators.volume);
+
+
+        // DOJI
+
+        set("doji-status", data.doji.status);
+
+        el("doji-status").className =
+            cls(data.doji.direction);
+
+        set(
+            "doji-box",
+            data.doji.description
+        );
+
+        el("doji-box").className =
+            "statusbox " +
+            (
+                data.doji.direction === "ALCISTA"
+                ? "bull"
+                : data.doji.direction === "BAJISTA"
+                ? "bear"
+                : "neutral"
+            );
+
+
+        // PATRÓN
+
+        set("pattern", data.pattern.name);
+
+
+        // PROYECCIONES
+
+        ["conservative", "average", "optimistic"].forEach(key => {
+
+            set(
+                key,
+                money(data.projections[key])
+            );
+
+        });
+
+        set(
+            "estimated",
+            money(data.projections.average)
+        );
+
+
+        // OHLC
+
+        ["open", "high", "low", "close"].forEach(key => {
+
+            set(key, money(data.ohlc[key]));
+
+        });
+
+
+        // TEMPORALIDADES
+
+        set("tf1", data.timeframes["1M"]);
+
+        set("tf5", data.timeframes["5M"]);
+
+        set("tf15", data.timeframes["15M"]);
+
+
+        // SOPORTES Y RESISTENCIAS
+
+        [
+            "support1",
+            "support2",
+            "resistance1",
+            "resistance2"
+        ].forEach(key => {
+
+            set(
+                key,
+                money(data.levels[key])
+            );
+
+        });
+
+
+        // CONCLUSIÓN
+
+        set("conclusion", signal.reason);
+
+
+        // SEÑAL FINAL
+
+        set("finaldirection", signal.direction);
+
+        el("finaldirection").className =
+            cls(signal.direction);
+
+        set(
+            "finalprob",
+            signal.probability + "%"
+        );
+
+
+        // GRÁFICA DE VELAS
+
+        candlesSeries.setData(
+            data.candles.map(candle => ({
+
+                time: candle.time,
+                open: candle.open,
+                high: candle.high,
+                low: candle.low,
+                close: candle.close
+
+            }))
+        );
+
+
+        l5.setData(
+            lineData(data.candles, data.ema5_series)
+        );
+
+        l13.setData(
+            lineData(data.candles, data.ema13_series)
+        );
+
+        l21.setData(
+            lineData(data.candles, data.ema21_series)
+        );
+
+
+        chart.timeScale().fitContent();
+
+
+        set(
+            "updated",
+            "Última actualización: " + data.updated
+        );
+
+
+    } catch (error) {
+
+        console.error(error);
+
+        set(
+            "connection",
+            "● ERROR KRAKEN: " + error.message
+        );
+
+        el("connection").style.color = "#ff526b";
+
+    }
+
+}
+
+
+// ==========================================================
+// ACTUALIZAR KALSHI
+// ==========================================================
+
+async function refreshKalshi() {
+
+    try {
+
+        const response = await fetch(
+            "/api/kalshi",
+            {
+                cache: "no-store"
+            }
+        );
+
+        if (!response.ok) {
+            throw Error("HTTP " + response.status);
+        }
+
+        const data = await response.json();
+
+        if (
+            !data.connected
+            || !data.markets.length
+        ) {
+
+            set(
+                "kalshi-connection",
+                "● KALSHI SIN MERCADOS ABIERTOS"
+            );
+
+            return;
+        }
+
+
+        const market = data.markets[0];
+
+        set(
+            "kalshi-connection",
+            "● CONECTADO A KALSHI"
+        );
+
+
+        set(
+            "yesask",
+            market.yes_ask === null
+            ? "--"
+            : market.yes_ask + "%"
+        );
+
+        set(
+            "noask",
+            market.no_ask === null
+            ? "--"
+            : market.no_ask + "%"
+        );
+
+        set(
+            "yesbid",
+            market.yes_bid === null
+            ? "--"
+            : market.yes_bid + "%"
+        );
+
+        set(
+            "nobid",
+            market.no_bid === null
+            ? "--"
+            : market.no_bid + "%"
+        );
+
+
+        set("ticker", market.ticker);
+
+        set("marketstatus", market.status);
+
+        set(
+            "kalshiupdated",
+            new Date().toLocaleTimeString()
+        );
+
+
+    } catch (error) {
+
+        set(
+            "kalshi-connection",
+            "● ERROR KALSHI: " + error.message
+        );
+
+    }
+
+}
+
+
+refresh();
+
+refreshKalshi();
+
+setInterval(refresh, 15000);
+
+setInterval(refreshKalshi, 15000);
+
+</script>
+
+</body>
+</html>
+"""
+
+
+# ==========================================================
+# RUTAS FLASK
+# ==========================================================
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+
+@app.route("/api/data")
+def api_data():
+
+    now = time.time()
+
+    with _cache_lock:
+
+        if (
+            _cache["data"] is not None
+            and now - _cache["updated"] < 8
+        ):
+            return jsonify(_cache["data"])
+
+    data = build_dashboard()
+
+    if "error" not in data:
+
+        with _cache_lock:
+
+            _cache["data"] = data
+
+            _cache["updated"] = now
+
+    return jsonify(data)
+
+
+@app.route("/api/kalshi")
+def api_kalshi():
+    return jsonify(get_kalshi_markets())
+
+
+@app.route("/health")
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "app": "BTC 15M CANDLE CALCULATOR PRO AI"
+    })
+
+
+# ==========================================================
+# INICIO
+# ==========================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get("PORT", "10000")
     )
 
-
-live_dashboard()
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
